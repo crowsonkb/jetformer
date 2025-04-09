@@ -4,9 +4,9 @@
 
 import argparse
 from copy import deepcopy
+from functools import lru_cache, wraps
 import math
 from pathlib import Path
-from typing import Tuple
 
 from einops import rearrange
 from PIL import Image
@@ -76,6 +76,19 @@ def zero_init(module):
     for param in module.parameters():
         nn.init.zeros_(param)
     return module
+
+
+def checkpoint(func, use_reentrant=False):
+    @wraps(func)
+    def inner(*args, **kwargs):
+        if torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                func, *args, **kwargs, use_reentrant=use_reentrant
+            )
+        else:
+            return func(*args, **kwargs)
+
+    return inner
 
 
 @torch.compile(dynamic=True)
@@ -193,26 +206,29 @@ class ChromaSubsample(nn.Module):
         return F.conv2d(yuv, self.filt_to_rgb)
 
 
-class RoPE2D(nn.Module):
-    def __init__(self, rot_dim: int, spatial: Tuple[int, int], theta: float = 10000.0):
+class RoPE(nn.Module):
+    def __init__(self, rot_dim: int, pos_dim: int = 1, theta: float = 10000.0):
         super().__init__()
-        if rot_dim % 4 != 0:
-            raise ValueError("rot_dim must be a multiple of 4")
         self.rot_dim = rot_dim
-        self.spatial = spatial
+        self.pos_dim = pos_dim
         self.theta = theta
-        freqs = theta ** torch.linspace(0, -1, rot_dim // 4 + 1)[:-1]
-        ramp_h = torch.arange(spatial[0], dtype=torch.float32)
-        ramp_w = torch.arange(spatial[1], dtype=torch.float32)
-        grid_h, grid_w = torch.meshgrid(ramp_h, ramp_w, indexing="ij")
-        tmp_h = grid_h.unsqueeze(-1) * freqs.to(grid_h.dtype)
-        tmp_w = grid_w.unsqueeze(-1) * freqs.to(grid_w.dtype)
-        tmp = torch.cat((tmp_h, tmp_w), dim=-1).flatten(0, 1)
-        self.register_buffer("cos", torch.cos(tmp))
-        self.register_buffer("sin", torch.sin(tmp))
+        freqs = theta ** torch.linspace(0, -1, rot_dim // (pos_dim * 2) + 1)[:-1]
+        self.register_buffer("freqs", freqs)
 
     def extra_repr(self):
-        return f"rot_dim={self.rot_dim}, spatial={self.spatial}, theta={self.theta}"
+        return f"rot_dim={self.rot_dim}, pos_dim={self.pos_dim}, theta={self.theta}"
+
+    @staticmethod
+    def make_pos(*shape, device=None):
+        ranges = [torch.arange(s, device=device) for s in shape]
+        pos = torch.stack(torch.meshgrid(*ranges, indexing="ij"), dim=-1)
+        return pos.flatten(0, len(shape) - 1)
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def make_cos_sin(pos, freqs):
+        tmp = (pos.unsqueeze(-1) * freqs).flatten(-2).unsqueeze(1)
+        return torch.cos(tmp), torch.sin(tmp)
 
     @staticmethod
     def apply_rotary_emb(x, cos, sin):
@@ -223,10 +239,9 @@ class RoPE2D(nn.Module):
         return torch.cat((y1.to(x3.dtype), y2.to(x3.dtype), x3), dim=-1)
 
     def forward(self, pos, q, k):
-        # pos is shape (batch, seq)
-        # q and k are shape (batch, n_heads, seq, dim)
-        cos = self.cos[pos.unsqueeze(-2)]
-        sin = self.sin[pos.unsqueeze(-2)]
+        # pos is shape (batch, seq, pos_dim)
+        # q and k are shape (batch, num_heads, seq, dim)
+        cos, sin = self.make_cos_sin(pos, self.freqs)
         q = self.apply_rotary_emb(q, cos, sin)
         k = self.apply_rotary_emb(k, cos, sin)
         return q, k
@@ -249,23 +264,21 @@ class FFN(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, spatial, causal):
+    def __init__(self, dim):
         super().__init__()
         self.head_dim = 64
-        self.n_heads = dim // self.head_dim
-        self.seq_len = spatial[0] * spatial[1]
-        self.causal = causal
+        self.num_heads = dim // self.head_dim
         self.norm = nn.LayerNorm((dim,))
         self.qkv_proj = nn.Linear(dim, dim * 3)
         self.out_proj = nn.Linear(dim, dim)
-        self.pos_emb = RoPE2D(self.head_dim // 2, spatial)
+        self.pos_emb = RoPE(self.head_dim // 2)
 
-    def init_cache(self, batch_size, device=None, dtype=None):
+    def init_cache(self, batch_size, seq_len, device=None, dtype=None):
         k = torch.zeros(
-            batch_size, self.n_heads, self.seq_len, self.head_dim, device=device, dtype=dtype
+            batch_size, self.num_heads, seq_len, self.head_dim, device=device, dtype=dtype
         )
         v = torch.zeros(
-            batch_size, self.n_heads, self.seq_len, self.head_dim, device=device, dtype=dtype
+            batch_size, self.num_heads, seq_len, self.head_dim, device=device, dtype=dtype
         )
         return k, v
 
@@ -275,12 +288,12 @@ class SelfAttention(nn.Module):
         qkv = self.qkv_proj(x)
         q, k, v = rearrange(qkv, "n s (t h d) -> t n h s d", t=3, d=self.head_dim)
         if cache is None:
-            pos = torch.arange(k.shape[2], device=k.device).tile((k.shape[0], 1))
+            pos = torch.arange(k.shape[2], device=k.device)[None, :, None]
             q, k = self.pos_emb(pos, q, k)
-            x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
+            x = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             end_index = index + 1
-            pos = torch.arange(index, end_index, device=k.device).tile((k.shape[0], 1))
+            pos = torch.arange(index, end_index, device=k.device)[None, :, None]
             q, k = self.pos_emb(pos, q, k)
             cache[0][:, :, index:end_index] = k
             cache[1][:, :, index:end_index] = v
@@ -293,13 +306,13 @@ class SelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, spatial, causal):
+    def __init__(self, dim):
         super().__init__()
-        self.attn = SelfAttention(dim, spatial, causal)
+        self.attn = SelfAttention(dim)
         self.ffn = FFN(dim)
 
-    def init_cache(self, batch_size, device=None, dtype=None):
-        return self.attn.init_cache(batch_size, device, dtype)
+    def init_cache(self, batch_size, seq_len, device=None, dtype=None):
+        return self.attn.init_cache(batch_size, seq_len, device, dtype)
 
     def forward(self, x, cache=None, index=None):
         x = self.attn(x, cache, index)
@@ -307,20 +320,37 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class GIVT(nn.Module):
-    def __init__(self, in_dim, dim, depth, spatial, num_components, num_classes):
+class GMMHead(nn.Module):
+    def __init__(self, in_features, out_features, num_components):
         super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
         self.num_components = num_components
+        self.logits_proj = nn.Linear(in_features, num_components)
+        self.mean_proj = nn.Linear(in_features, num_components * out_features)
+        self.logvar_proj = zero_init(nn.Linear(in_features, num_components * out_features))
+
+    def extra_repr(self):
+        return f"in_features={self.in_features}, out_features={self.out_features}, num_components={self.num_components}"
+
+    def forward(self, x):
+        logits = self.logits_proj(x)
+        mean = self.mean_proj(x).unflatten(-1, (self.num_components, self.out_features))
+        logvar = self.logvar_proj(x).unflatten(-1, (self.num_components, self.out_features))
+        return logits, mean, logvar
+
+
+class GIVT(nn.Module):
+    def __init__(self, in_dim, dim, depth, num_components, num_classes):
+        super().__init__()
         self.in_proj = nn.Linear(in_dim, dim)
         self.cls_emb = nn.Embedding(num_classes, dim)
-        self.blocks = nn.ModuleList(TransformerBlock(dim, spatial, True) for _ in range(depth))
+        self.blocks = nn.ModuleList(TransformerBlock(dim) for _ in range(depth))
         self.out_norm = nn.LayerNorm((dim,))
-        self.out_proj_logits = nn.Linear(dim, num_components)
-        self.out_proj_mean = nn.Linear(dim, num_components * in_dim)
-        self.out_proj_logvar = zero_init(nn.Linear(dim, num_components * in_dim))
+        self.out_head = GMMHead(dim, in_dim, num_components)
 
-    def init_cache(self, batch_size, device=None, dtype=None):
-        return [block.init_cache(batch_size, device, dtype) for block in self.blocks]
+    def init_cache(self, batch_size, seq_len, device=None, dtype=None):
+        return [block.init_cache(batch_size, seq_len, device, dtype) for block in self.blocks]
 
     def forward(self, x, y, cache=None, index=None):
         x = self.in_proj(x)
@@ -329,28 +359,75 @@ class GIVT(nn.Module):
         x = x if cache is None else x[:, -1:].contiguous()
         cache = [None] * len(self.blocks) if cache is None else cache
         for block, cache_block in zip(self.blocks, cache):
-            x = torch.utils.checkpoint.checkpoint(block, x, cache_block, index, use_reentrant=False)
+            x = checkpoint(block)(x, cache_block, index)
         x = self.out_norm(x)
-        logits = self.out_proj_logits(x)
-        mean = self.out_proj_mean(x).unflatten(-1, (self.num_components, -1))
-        logvar = self.out_proj_logvar(x).unflatten(-1, (self.num_components, -1))
-        return logits, mean, logvar
+        x = self.out_head(x)
+        return x
+
+
+class SelfAttentionForJet(nn.Module):
+    def __init__(self, dim, kernel_size=(7, 7)):
+        super().__init__()
+        self.head_dim = 64
+        self.num_heads = dim // self.head_dim
+        self.kernel_size = kernel_size
+        self.norm = nn.LayerNorm((dim,))
+        self.qkv_proj = nn.Linear(dim, dim * 3)
+        self.out_proj = nn.Linear(dim, dim)
+        self.pos_emb = RoPE(self.head_dim // 2, pos_dim=2)
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def make_attn_mask(pos, padding_mask, kernel_size):
+        # pos is (n, s, 2), dtype long
+        # padding mask is (n, s), dtype bool
+        # return type is (n, 1, s, s), dtype bool
+        mh1 = pos[:, :, None, 0] <= pos[:, None, :, 0] + kernel_size[0] // 2
+        mh2 = pos[:, :, None, 0] > pos[:, None, :, 0] - (kernel_size[0] + 1) // 2
+        mw1 = pos[:, :, None, 1] <= pos[:, None, :, 1] + kernel_size[1] // 2
+        mw2 = pos[:, :, None, 1] > pos[:, None, :, 1] - (kernel_size[1] + 1) // 2
+        mask1 = mh1 & mh2 & mw1 & mw2
+        mask2 = padding_mask[:, None, :] & padding_mask[:, :, None]
+        return (mask1 & mask2)[:, None, :, :]
+
+    def forward(self, x, pos, padding_mask):
+        skip = x
+        x = self.norm(x)
+        qkv = self.qkv_proj(x)
+        q, k, v = rearrange(qkv, "n s (t h d) -> t n h s d", t=3, d=self.head_dim)
+        q, k = self.pos_emb(pos, q, k)
+        attn_mask = self.make_attn_mask(pos, padding_mask, self.kernel_size)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask)
+        x = rearrange(x, "n h s d -> n s (h d)")
+        x = self.out_proj(x)
+        return x + skip
+
+
+class TransformerBlockForJet(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.attn = SelfAttentionForJet(dim)
+        self.ffn = FFN(dim)
+
+    def forward(self, x, pos, padding_mask):
+        x = self.attn(x, pos, padding_mask)
+        x = self.ffn(x)
+        return x
 
 
 class TransformerForJet(nn.Module):
-    def __init__(self, in_dim, dim, depth, spatial, out_scale):
+    def __init__(self, in_dim, dim, depth, out_scale):
         super().__init__()
-        self.depth = depth
         self.out_scale = out_scale
         self.in_proj = nn.Linear(in_dim, dim)
-        self.blocks = nn.ModuleList([TransformerBlock(dim, spatial, False) for _ in range(depth)])
+        self.blocks = nn.ModuleList([TransformerBlockForJet(dim) for _ in range(depth)])
         self.out_norm = nn.LayerNorm((dim,))
         self.out_proj = zero_init(nn.Linear(dim, in_dim * 2))
 
-    def forward(self, x):
+    def forward(self, x, pos, padding_mask):
         x = self.in_proj(x)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, pos, padding_mask)
         x = self.out_norm(x)
         x = self.out_proj(x)
         a, b = x.chunk(2, dim=-1)
@@ -358,33 +435,34 @@ class TransformerForJet(nn.Module):
 
 
 class AffineCoupling(nn.Module):
-    def __init__(self, in_dim, dim, depth, spatial, out_scale):
+    def __init__(self, in_dim, dim, depth, out_scale):
         super().__init__()
         if in_dim % 2 != 0:
             raise ValueError("in_dim must be even")
-        self.half_1 = TransformerForJet(in_dim // 2, dim, depth, spatial, out_scale)
-        self.half_2 = TransformerForJet(in_dim // 2, dim, depth, spatial, out_scale)
+        self.transformer_1 = TransformerForJet(in_dim // 2, dim, depth, out_scale)
+        self.transformer_2 = TransformerForJet(in_dim // 2, dim, depth, out_scale)
         index_1, index_2 = torch.randperm(in_dim).chunk(2)
         self.register_buffer("index_1", index_1.contiguous())
         self.register_buffer("index_2", index_2.contiguous())
 
-    def forward(self, x):
+    def forward(self, x, pos, padding_mask):
         x1, x2 = x[..., self.index_1], x[..., self.index_2]
-        a1, b1 = torch.utils.checkpoint.checkpoint(self.half_1, x1, use_reentrant=False)
+        a1, b1 = checkpoint(self.transformer_1)(x1, pos, padding_mask)
         x2 = x2 * torch.exp(b1) + a1
-        a2, b2 = torch.utils.checkpoint.checkpoint(self.half_2, x2, use_reentrant=False)
+        logdet_1 = torch.sum(b1 * padding_mask.unsqueeze(-1), dim=(-2, -1))
+        a2, b2 = checkpoint(self.transformer_2)(x2, pos, padding_mask)
         x1 = x1 * torch.exp(b2) + a2
+        logdet_2 = torch.sum(b2 * padding_mask.unsqueeze(-1), dim=(-2, -1))
         x = torch.empty_like(x)
         x[..., self.index_1] = x1.to(x.dtype)
         x[..., self.index_2] = x2.to(x.dtype)
-        logdet = b1.flatten(1).sum(dim=-1) + b2.flatten(1).sum(dim=-1)
-        return x, logdet
+        return x, logdet_1 + logdet_2
 
-    def inverse(self, x):
+    def inverse(self, x, pos, padding_mask):
         x1, x2 = x[..., self.index_1], x[..., self.index_2]
-        a2, b2 = self.half_2(x2)
+        a2, b2 = self.transformer_2(x2, pos, padding_mask)
         x1 = (x1 - a2) * torch.exp(-b2)
-        a1, b1 = self.half_1(x1)
+        a1, b1 = self.transformer_1(x1, pos, padding_mask)
         x2 = (x2 - a1) * torch.exp(-b1)
         x = torch.empty_like(x)
         x[..., self.index_1] = x1.to(x.dtype)
@@ -393,27 +471,24 @@ class AffineCoupling(nn.Module):
 
 
 class Jet(nn.Module):
-    def __init__(self, in_dim, dim, inner_depth, depth, spatial):
+    def __init__(self, in_dim, dim, inner_depth, depth):
         super().__init__()
         if depth % 2 != 0:
             raise ValueError("depth must be even")
         self.blocks = nn.ModuleList(
-            [
-                AffineCoupling(in_dim, dim, inner_depth, spatial, 2 / depth)
-                for _ in range(depth // 2)
-            ]
+            [AffineCoupling(in_dim, dim, inner_depth, 2 / depth) for _ in range(depth // 2)]
         )
 
-    def forward(self, x):
-        logdet = 0
+    def forward(self, x, pos, padding_mask):
+        logdets = []
         for block in self.blocks:
-            x, ld = block(x)
-            logdet += ld
-        return x, logdet
+            x, logdet = block(x, pos, padding_mask)
+            logdets.append(logdet)
+        return x, torch.stack(logdets).sum(dim=0)
 
-    def inverse(self, x):
+    def inverse(self, x, pos, padding_mask):
         for block in reversed(self.blocks):
-            x = block.inverse(x)
+            x = block.inverse(x, pos, padding_mask)
         return x
 
 
@@ -475,7 +550,6 @@ def main():
         in_dim=latent_dim,
         dim=768,
         depth=12,
-        spatial=spatial,
         num_components=num_components,
         num_classes=num_classes + 1,  # add one for the unconditional class
     ).to(device)
@@ -485,7 +559,6 @@ def main():
         dim=512,
         inner_depth=3,
         depth=12,
-        spatial=spatial,
     ).to(device)
 
     du.broadcast_tensors(givt_raw.parameters())
@@ -516,9 +589,13 @@ def main():
     )
     sched = optim.lr_scheduler.LambdaLR(opt, lambda step: 1 - 0.9 ** (step + 1))
 
+    pos = RoPE.make_pos(*spatial, device=device).unsqueeze(0)
+    padding_mask = torch.ones(1, seq_len, device=device, dtype=torch.bool)
+
     epoch = 0
     step = 0
 
+    # not correct classifier-free guidance, but correct cfg can break
     def apply_cond_scale(logits, mean, logvar, cond_scale):
         lc, lu = logits.chunk(2)
         mc, mu = mean.chunk(2)
@@ -541,39 +618,37 @@ def main():
             y = torch.zeros(demo_bs_per_rank, device=device, dtype=torch.long)
         y_in = torch.cat((y, torch.full((demo_bs_per_rank,), num_classes, device=device)))
 
-        cache = givt_ema.init_cache(demo_bs_per_rank * 2, device=device, dtype=torch.bfloat16)
+        cache = givt_ema.init_cache(
+            demo_bs_per_rank * 2, seq_len, device=device, dtype=torch.bfloat16
+        )
 
         # sample the latent from the GIVT
         for index in trange(seq_len, disable=rank != 0):
             x_latent_in = torch.cat((x_latent[:, :index], x_latent[:, :index]))
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits, mean, logvar = givt_ema(x_latent_in, y_in, cache, index)
-                logits, mean, logvar = apply_cond_scale(logits, mean, logvar, args.cond_scale)
-                sample = gmm_sample(
-                    logits, mean, logvar, top_p_weights=args.top_p, top_p_component=args.top_p
-                )
+                gmm = givt_ema(x_latent_in, y_in, cache, index)
+                gmm = apply_cond_scale(*gmm, args.cond_scale)
+                sample = gmm_sample(*gmm, top_p_weights=args.top_p, top_p_component=args.top_p)
                 x_latent[:, index] = sample[:, 0]
 
         # decode the latent
         x_prior = torch.randn(demo_bs_per_rank, seq_len, prior_dim, device=device)
         x_flowed = torch.cat((x_latent, x_prior), dim=-1)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            x_noised = jet_ema.inverse(x_flowed)
+            x_noised = jet_ema.inverse(x_flowed, pos, padding_mask)
 
         # denoise
         with torch.enable_grad():
             x_noised_ = x_noised.clone().requires_grad_()
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                x_flowed, logdet = jet_ema(x_noised_)
+                x_flowed, logdet = jet_ema(x_noised_, pos, padding_mask)
                 x_latent, x_prior = x_flowed[..., :latent_dim], x_flowed[..., latent_dim:]
                 x_latent_in = torch.cat((x_latent[:, :-1], x_latent[:, :-1]))
-                logits, mean, logvar = givt_ema(x_latent_in, y_in)
-                logits, mean, logvar = apply_cond_scale(logits, mean, logvar, args.cond_scale)
-                ll = (
-                    gmm_loglik(x_latent, logits, mean, logvar).sum()
-                    + D.Normal(0, 1).log_prob(x_prior).sum()
-                    + logdet.sum()
-                )
+                gmm = givt_ema(x_latent_in, y_in)
+                gmm = apply_cond_scale(*gmm, args.cond_scale)
+                ll_gmm = torch.sum(gmm_loglik(x_latent, *gmm) * padding_mask)
+                ll_prior = torch.sum(D.Normal(0, 1).log_prob(x_prior) * padding_mask.unsqueeze(-1))
+                ll = ll_gmm + ll_prior + torch.sum(logdet)
             grad = torch.autograd.grad(ll, x_noised_)[0]
         x = x_noised + args.sigma**2 * grad
 
@@ -619,19 +694,17 @@ def main():
             # forward pass
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 # encode the noised images to latents
-                x_flowed, logdet = jet(x_noised)
+                x_flowed, logdet = jet(x_noised, pos, padding_mask)
                 x_latent, x_prior = x_flowed[..., :latent_dim], x_flowed[..., latent_dim:]
 
                 # predict the next latent patch
-                logits, mean, logvar = givt(x_latent[:, :-1], y)
+                gmm = givt(x_latent[:, :-1], y)
 
                 # compute the loss (nats per dimension)
-                ll_p = x_noised_dist.log_prob(x_noised).sum()
-                ll_q = (
-                    gmm_loglik(x_latent, logits, mean, logvar).sum()
-                    + D.Normal(0, 1).log_prob(x_prior).sum()
-                    + logdet.sum()
-                )
+                ll_p = torch.sum(x_noised_dist.log_prob(x_noised) * padding_mask.unsqueeze(-1))
+                ll_gmm = torch.sum(gmm_loglik(x_latent, *gmm) * padding_mask)
+                ll_prior = torch.sum(D.Normal(0, 1).log_prob(x_prior) * padding_mask.unsqueeze(-1))
+                ll_q = ll_gmm + ll_prior + torch.sum(logdet)
                 loss = (ll_p - ll_q) / x_noised.numel()
 
             # backward pass and optimizer step
