@@ -173,7 +173,7 @@ class ChromaSubsample(nn.Module):
     def __init__(self):
         super().__init__()
         filt_to_yuv = torch.tensor(
-            [[0.299, 0.587, 0.114], [-0.147, -0.289, 0.436], [0.615, -0.515, -0.100]]
+            [[0.2126, 0.7152, 0.0722], [-0.09991, -0.33609, 0.436], [0.615, -0.55861, -0.05639]]
         )
         filt_to_rgb = torch.linalg.inv(filt_to_yuv)
         self.register_buffer("filt_to_yuv", filt_to_yuv[..., None, None])
